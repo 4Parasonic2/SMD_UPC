@@ -39,4 +39,4 @@ LAB1_Author1surnameAuthor2surname.zip
 ---
 The property graph models an academic publishing ecosystem, capturing papers, authors, venues, keywords, and institutions along with their relationships.
 > **Schema diagram:**
-![Graph Model](SMD.drawio.png)
+![Graph Model](A/A.1/SMD.drawio.png)
