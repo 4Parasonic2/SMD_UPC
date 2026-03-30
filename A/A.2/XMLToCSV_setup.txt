@@ -1,0 +1,6 @@
+get xml file from here: https://dblp.uni-trier.de/xml/
+
+using the recommended GitHub tool: https://github.com/ThomHurks/dblp-to-csv
+
+may need to use this for python libraries: 
+python -m pip install --upgrade pip setuptools wheel
