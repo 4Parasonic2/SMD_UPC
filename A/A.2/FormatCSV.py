@@ -3,12 +3,11 @@ FormatCSV.py — A.2 (generate CSVs only)
 ========================================
   STEP 1 · Clean CSVs     — normalises raw DBLP CSVs
   STEP 2 · Synthetic data — Venues, Issues, Keywords, Reviews + edge CSVs
+                            (includes rel_cites.csv — Paper→Paper cite edges)
 
-Writes ``pipeline_config.json`` in this folder so ``UploadCSV.py`` can apply the
-same data fraction when loading into Neo4j (row limits on large DBLP files).
-
-At startup:
-  • Data fraction only (e.g. 0.05 = 5 % test, 1.0 = full)
+Adjust MAX_PAPERS, MAX_AUTHORS, and SAMPLE_FRACTION below to control
+how much data is loaded.  After changing them, delete the
+Synthetic_data_Csvs/ folder and rerun this script.
 
 Requirements:
     pip install pandas
@@ -37,87 +36,47 @@ os.makedirs(SYNTHETIC_FOLDER, exist_ok=True)
 
 PIPELINE_CONFIG = os.path.join(SCRIPT_DIR, "pipeline_config.json")
 
-# ── Sampling — written by _prompt_format_settings() ──────────────────────────
-SYNTH_SAMPLE_FRACTION: float = 0.10
-SYNTH_MAX_PAPERS:      int   = 80_000
-SYNTH_MAX_AUTHORS:     int   = 120_000
-
-# Full-dataset row estimates used for scaling.
-_BASE_AUTHORS     = 4_200_000
-_BASE_AUTHORED    = 28_000_000
-_BASE_MAX_PAPERS  = 800_000
-_BASE_MAX_AUTHORS = 1_200_000
+# =============================================================================
+# DATA SIZE PARAMETERS  ← edit these freely; rerun FormatCSV.py to regenerate
+# =============================================================================
+MAX_PAPERS      = 20_000   # hard cap on total Paper nodes (articles + inproceedings)
+MAX_AUTHORS     = 30_000   # hard cap on Author nodes
+# SAMPLE_FRACTION only affects how fast the large DBLP CSVs are *read* for
+# the synth-data step.  It does NOT control how many nodes end up in Neo4j —
+# that is MAX_PAPERS / MAX_AUTHORS above.
+SAMPLE_FRACTION = 0.10
 
 random.seed(42)
 
 
 # =============================================================================
-# STARTUP — data fraction only (no Neo4j)
+# STARTUP — display active parameters and write pipeline_config.json
 # =============================================================================
 
-def _prompt_format_settings() -> None:
-    """Ask for the data fraction; set synth globals and write ``pipeline_config.json``."""
-    global SYNTH_SAMPLE_FRACTION, SYNTH_MAX_PAPERS, SYNTH_MAX_AUTHORS
-
+def _print_data_params() -> None:
+    """Print the active data-size parameters and persist them to pipeline_config.json."""
     print("=" * 60)
-    print("  FormatCSV.py — data sampling")
+    print("  FormatCSV.py — active data parameters")
     print("=" * 60)
+    print(f"  MAX_PAPERS      : {MAX_PAPERS:,}  (Paper node cap)")
+    print(f"  MAX_AUTHORS     : {MAX_AUTHORS:,}  (Author node cap)")
+    print(f"  SAMPLE_FRACTION : {SAMPLE_FRACTION}   (DBLP read speed-up only)")
+    print()
+    print("  To change these values, edit the constants at the top of FormatCSV.py,")
+    print("  delete Synthetic_data_Csvs/, then rerun.")
 
-    env_sf = os.environ.get("SYNTH_SAMPLE_FRACTION", "").strip()
-    if env_sf:
-        raw, source = env_sf, "env var SYNTH_SAMPLE_FRACTION"
-    else:
-        print()
-        print("  Data fraction controls sampling and caps for CSV generation")
-        print("  and the matching LOAD CSV row limits for UploadCSV.py.")
-        print("  Examples:  0.05 = 5 %   0.25 = 25 %   1.0 = full")
-        try:
-            raw = input("  Data fraction [0.01 – 1.0, default 0.10] : ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\n  Aborted.")
-            sys.exit(0)
-        source = "user input"
-
-    fraction = 0.10
-    if raw:
-        try:
-            fraction = float(raw)
-        except ValueError:
-            print(f"  [warning] '{raw}' is not a number — using 0.10")
-    fraction = max(0.01, min(1.0, fraction))
-
-    SYNTH_SAMPLE_FRACTION = fraction
-    SYNTH_MAX_PAPERS      = max(1_000, int(_BASE_MAX_PAPERS  * fraction))
-    SYNTH_MAX_AUTHORS     = max(1_000, int(_BASE_MAX_AUTHORS * fraction))
-
-    if fraction >= 1.0:
-        upload_node_limit = None
-        upload_rel_limit  = None
-    else:
-        upload_node_limit = max(1_000, int(_BASE_AUTHORS * fraction))
-        upload_rel_limit  = max(5_000, int(_BASE_AUTHORED * fraction))
-
-    print(f"\n  Confirmed ({source}):")
-    print(f"    Data fraction    : {fraction:.0%}")
-    print(f"    Synth papers cap : {SYNTH_MAX_PAPERS:>10,}")
-    print(f"    Synth author cap : {SYNTH_MAX_AUTHORS:>10,}")
-    if upload_node_limit is None:
-        print("    Upload row limits: full DBLP (no cap)")
-    else:
-        print(f"    Upload node rows : {upload_node_limit:>10,}  per DBLP node file")
-        print(f"    Upload rel  rows : {upload_rel_limit:>10,}  per DBLP rel  file")
-
+    # Persist so UploadCSV.py uses matching LOAD CSV row limits.
     cfg = {
-        "fraction":           fraction,
-        "synth_max_papers":   SYNTH_MAX_PAPERS,
-        "synth_max_authors":  SYNTH_MAX_AUTHORS,
-        "upload_node_limit":  upload_node_limit,
-        "upload_rel_limit":   upload_rel_limit,
+        "max_papers":         MAX_PAPERS,
+        "max_authors":        MAX_AUTHORS,
+        "upload_paper_limit": MAX_PAPERS,
+        "upload_author_limit":MAX_AUTHORS,
+        "upload_rel_limit":   MAX_AUTHORS * 10,   # generous: ~10 rels per author avg
     }
     with open(PIPELINE_CONFIG, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     print(f"\n  Saved {PIPELINE_CONFIG}")
-    print("  (UploadCSV.py reads this so the graph load matches this run.)\n")
+    print("  (UploadCSV.py reads this file for LOAD CSV row limits.)\n")
 
 
 # =============================================================================
@@ -232,13 +191,22 @@ def _save_synth(data, filename: str) -> pd.DataFrame:
 
 _LOAD_CHUNK = 50_000
 
-def _load_clean(filename: str, sample_fraction: float = 1.0) -> pd.DataFrame:
+def _load_clean(filename: str, sample_fraction: float = 1.0,
+                max_rows: int | None = None) -> pd.DataFrame:
+    """Load a cleaned CSV.
+
+    Pass ``max_rows`` to read exactly the first N data rows (fast, no sampling).
+    Pass ``sample_fraction`` to thin a large file by reading every Nth row.
+    If both are given, ``max_rows`` wins.
+    """
     path = os.path.join(CLEANED_FOLDER, filename)
     if not os.path.exists(path):
         print(f"  [warning] not found: {filename}")
         return pd.DataFrame()
-    kw   = dict(sep=";", dtype=str, on_bad_lines="skip",
-                encoding="utf-8", quotechar='"')
+    kw = dict(sep=";", dtype=str, on_bad_lines="skip",
+              encoding="utf-8", quotechar='"')
+    if max_rows is not None:
+        return pd.read_csv(path, nrows=max_rows, **kw)
     step = max(1, int(round(1.0 / sample_fraction))) if sample_fraction < 1 else 1
     if step <= 1:
         return pd.read_csv(path, **kw)
@@ -276,25 +244,29 @@ def run_step_synth() -> None:
             return 0
 
     if folder_has_csvs(SYNTHETIC_FOLDER):
-        if _row_count("venue_nodes.csv") > 0 and _row_count("review_nodes.csv") > 0:
+        if (_row_count("venue_nodes.csv") > 0
+                and _row_count("review_nodes.csv") > 0
+                and _row_count("rel_cites.csv") > 0):
             print(f"  [skip] {SYNTHETIC_FOLDER} already populated.")
             return
         print("  [re-generate] Incomplete synthetic files — regenerating.")
 
-    sf = SYNTH_SAMPLE_FRACTION
-    print(f"  Sample fraction  : {sf:.2f}")
-    print(f"  Max papers       : {SYNTH_MAX_PAPERS:,}")
-    print(f"  Max authors      : {SYNTH_MAX_AUTHORS:,}")
+    sf = SAMPLE_FRACTION
+    print(f"  Sample fraction  : {sf:.2f}  (reading speed only)")
+    print(f"  Max papers       : {MAX_PAPERS:,}")
+    print(f"  Max authors      : {MAX_AUTHORS:,}")
 
     # ── 2.0 Load real DBLP data ──────────────────────────────────────────────
     print("\n  -- 2.0  Loading real DBLP data")
 
-    article_df   = _load_clean("output_article_clean.csv", sf)
+    # Load exactly the first MAX_PAPERS rows — same slice UploadCSV loads with
+    # WITH row LIMIT MAX_PAPERS, so synthetic edge IDs are guaranteed to match.
+    article_df   = _load_clean("output_article_clean.csv", max_rows=MAX_PAPERS)
     art_id_col   = _find_col(article_df, ["article", ":id"])
     art_year_col = _find_col(article_df, ["year"])
     art_vol_col  = _find_col(article_df, ["volume"])
 
-    inproc_df        = _load_clean("output_inproceedings_clean.csv", sf)
+    inproc_df        = _load_clean("output_inproceedings_clean.csv", max_rows=MAX_PAPERS)
     inproc_id_col    = _find_col(inproc_df, ["inproceedings", ":id"])
     inproc_cross_col = _find_col(inproc_df, ["crossref"])
 
@@ -313,9 +285,11 @@ def run_step_synth() -> None:
     aj_start_col = _find_col(art_jnl_df, [":start_id"])
     aj_end_col   = _find_col(art_jnl_df, [":end_id"])
 
-    author_df  = _load_clean("output_author_clean.csv", sf)
+    author_df  = _load_clean("output_author_clean.csv", max_rows=MAX_AUTHORS)
     author_col = _find_col(author_df, [":id"])
 
+    # Authorship map for COI avoidance — sample to limit memory, IDs still match
+    # because paper_ids and author_ids are drawn from the first-N rows above.
     authored_df  = _load_clean("output_author_authored_by_clean.csv", sf)
     ab_paper_col = _find_col(authored_df, [":start_id"])
     ab_auth_col  = _find_col(authored_df, [":end_id"])
@@ -323,21 +297,18 @@ def run_step_synth() -> None:
     article_ids = [p for p in (article_df[art_id_col].dropna().str.strip() if art_id_col else []) if p]
     inproc_ids  = [p for p in (inproc_df[inproc_id_col].dropna().str.strip() if inproc_id_col else []) if p]
     article_id_set = set(article_ids)
-    paper_ids      = list(dict.fromkeys(article_ids + inproc_ids))
-    loaded_papers  = len(paper_ids)
-    if SYNTH_MAX_PAPERS > 0 and len(paper_ids) > SYNTH_MAX_PAPERS:
-        paper_ids = paper_ids[:SYNTH_MAX_PAPERS]
-    print(f"  Articles      : {len(article_ids):>7,}")
-    print(f"  Inproceedings : {len(inproc_ids):>7,}")
-    print(f"  Papers kept   : {len(paper_ids):>7,}  (from {loaded_papers:,})")
+    # Combine without duplicates; each file was already limited to MAX_PAPERS rows,
+    # so total papers ≤ 2 × MAX_PAPERS (matching UploadCSV's two separate LOAD CSV calls).
+    paper_ids = list(dict.fromkeys(article_ids + inproc_ids))
+    print(f"  Articles      : {len(article_ids):>7,}  (first {MAX_PAPERS:,} rows)")
+    print(f"  Inproceedings : {len(inproc_ids):>7,}  (first {MAX_PAPERS:,} rows)")
+    print(f"  Papers total  : {len(paper_ids):>7,}")
 
     author_ids = [
         a for a in (author_df[author_col].dropna().str.strip() if author_col else [])
         if a and a.lower() not in ("nan", ":id")
     ]
-    if SYNTH_MAX_AUTHORS > 0 and len(author_ids) > SYNTH_MAX_AUTHORS:
-        author_ids = author_ids[:SYNTH_MAX_AUTHORS]
-    print(f"  Authors kept  : {len(author_ids):>7,}")
+    print(f"  Authors       : {len(author_ids):>7,}  (first {MAX_AUTHORS:,} rows)")
 
     paper_to_authors: dict = {}
     if ab_paper_col and ab_auth_col:
@@ -457,15 +428,49 @@ def run_step_synth() -> None:
     # ── 2.3 Keyword nodes ────────────────────────────────────────────────────
     print("\n  -- 2.3  Keyword nodes  (synthetic fixed list)")
     KEYWORD_NAMES = [
+        # Knowledge representation & graphs
         "knowledge graph", "ontology", "RDF", "SPARQL", "graph database",
-        "semantic web", "linked data", "property graph", "graph neural network",
-        "knowledge representation", "data integration", "schema matching",
-        "data quality", "data management", "information extraction",
-        "entity linking", "relation extraction", "machine learning",
-        "deep learning", "natural language processing", "question answering",
-        "embedding", "reasoning", "inference", "graph processing",
-        "graph algorithms", "distributed systems", "query optimization",
-        "recommender systems", "knowledge base",
+        "semantic web", "linked data", "property graph", "knowledge base",
+        "knowledge representation", "description logic", "owl", "schema",
+        # Graph learning & algorithms
+        "graph neural network", "graph embedding", "graph algorithms",
+        "graph processing", "graph partitioning", "subgraph matching",
+        "community detection", "link prediction", "node classification",
+        # Machine learning & AI
+        "machine learning", "deep learning", "transfer learning",
+        "reinforcement learning", "federated learning", "active learning",
+        "semi-supervised learning", "self-supervised learning",
+        "neural network", "convolutional neural network", "transformer",
+        "attention mechanism", "large language model", "generative model",
+        # Natural language processing
+        "natural language processing", "information extraction",
+        "entity linking", "relation extraction", "question answering",
+        "text classification", "sentiment analysis", "named entity recognition",
+        "machine translation", "summarization", "coreference resolution",
+        # Data management & integration
+        "data integration", "schema matching", "data quality",
+        "data management", "data cleaning", "data provenance",
+        "data warehouse", "ETL", "data lake", "master data management",
+        # Databases & querying
+        "query optimization", "query processing", "relational database",
+        "NoSQL", "NewSQL", "distributed database", "transaction processing",
+        "indexing", "OLAP", "OLTP",
+        # Distributed & cloud systems
+        "distributed systems", "cloud computing", "edge computing",
+        "stream processing", "batch processing", "fault tolerance",
+        "consensus protocol", "replication", "sharding",
+        # Reasoning & logic
+        "reasoning", "inference", "automated reasoning", "theorem proving",
+        "satisfiability", "constraint satisfaction", "answer set programming",
+        # Recommendation & personalisation
+        "recommender systems", "collaborative filtering", "content-based filtering",
+        "matrix factorization", "user modeling", "personalization",
+        # Privacy & security
+        "privacy", "differential privacy", "access control",
+        "federated query", "data anonymization",
+        # Evaluation & benchmarking
+        "benchmark", "evaluation", "scalability", "performance",
+        "embedding", "representation learning",
     ]
     keyword_rows = [{"keywordId": f"KW-{i:04d}", "name": n}
                     for i, n in enumerate(KEYWORD_NAMES)]
@@ -523,15 +528,33 @@ def run_step_synth() -> None:
     _save_synth(wrote_rev_rows, "rel_wrote_review.csv")
     _save_synth(about_rows,     "rel_about.csv")
 
+    # ── 2.6 Cite edges (Paper → Paper, synthetic) ────────────────────────────
+    # The DBLP cite data uses an intermediate cite-entity node; the coverage
+    # within any small paper subset is too sparse to produce real results.
+    # We generate synthetic citations so every paper has guaranteed outgoing
+    # cites and queries always return results.
+    # Each paper cites SYNTH_CITES_PER_PAPER others chosen at random.
+    SYNTH_CITES_PER_PAPER = 3
+    print(f"\n  -- 2.6  Cite edges  (Paper → Paper, synthetic, {SYNTH_CITES_PER_PAPER} per paper)")
+    cites_rows: list = []
+    pid_list = list(paper_ids)
+    for pid in pid_list:
+        candidates = [p for p in pid_list if p != pid]
+        n = min(SYNTH_CITES_PER_PAPER, len(candidates))
+        for tgt in random.sample(candidates, n):
+            cites_rows.append({":START_ID": pid, ":END_ID": tgt})
+    _save_synth(pd.DataFrame(cites_rows).drop_duplicates(), "rel_cites.csv")
+
     print(f"\n  Venues   : {len(venue_rows):,}")
     print(f"  Issues   : {len(issue_rows):,}")
     print(f"  Keywords : {len(keyword_rows):,}")
     print(f"  Reviews  : {len(review_rows):,}")
+    print(f"  Cites    : {len(cites_rows):,}")
     print(f"\n  Files → {SYNTHETIC_FOLDER}")
 
 
 def main() -> None:
-    _prompt_format_settings()
+    _print_data_params()
     run_step_clean()
     run_step_synth()
     print("\n  Next: copy CSVs to Neo4j’s import folder, then run UploadCSV.py")

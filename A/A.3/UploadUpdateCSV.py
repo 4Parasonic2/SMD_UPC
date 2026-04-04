@@ -1,16 +1,20 @@
 """
 UploadUpdateCSV.py — A.3
 ========================
-Load the CSV files from ``Update_Csvs/`` (produced by ``FormatUpdateCSV.py``)
-into Neo4j using ``LOAD CSV`` + ``MERGE``.
+Loads the Organization nodes and affiliated_with edges produced by
+FormatUpdateCSV.py into an existing Neo4j graph.
 
-**Before running:** copy the CSV files from ``A/A.3/Update_Csvs/`` into Neo4j’s
-import directory, or adjust the ``file:///`` paths below.
+Before running:
+  1. Run FormatUpdateCSV.py to generate the two CSV files.
+  2. Copy Update_Csvs/organization_nodes.csv and
+          Update_Csvs/rel_affiliated_with.csv
+     into Neo4j's import directory (same folder used by UploadCSV.py).
+  3. Run this script.
 
-Edit the Cypher blocks in ``run_updates()`` to match the files and schema from
-your A.3 report (constraints, labels, relationship types).
+The script is additive — it MERGEs nodes and relationships so it is safe
+to re-run without creating duplicates.
 
-Prerequisites:
+Requirements:
     pip install neo4j
 """
 
@@ -22,73 +26,162 @@ import sys
 
 from neo4j import GraphDatabase
 
-NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+NEO4J_URI  = os.environ.get("NEO4J_URI",      "bolt://localhost:7687")
 NEO4J_USER = os.environ.get("NEO4J_USERNAME", "neo4j")
 
+NODE_BATCH = 200
+REL_BATCH  = 500
 
-def get_password() -> str:
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _get_password() -> str:
     env = os.environ.get("NEO4J_PASSWORD", "").strip()
     if env:
+        print("  Neo4j password : (from NEO4J_PASSWORD env var)")
         return env
-    return getpass.getpass("Neo4j password: ").strip()
+    try:
+        return getpass.getpass("  Neo4j password : ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\n  Aborted.")
+        sys.exit(0)
 
+
+def _run(session, description: str, query: str) -> None:
+    """Execute a Cypher query and print a summary of counters."""
+    try:
+        summary = session.run(query).consume()
+        c = summary.counters
+        print(f"  ✓  {description}")
+        if c.nodes_created:         print(f"       nodes created      : {c.nodes_created:,}")
+        if c.relationships_created: print(f"       rels  created      : {c.relationships_created:,}")
+        if c.properties_set:        print(f"       properties set     : {c.properties_set:,}")
+    except Exception as e:
+        print(f"  ✗  {description}")
+        print(f"     ERROR: {e}")
+        sys.exit(1)
+
+
+def _pause() -> None:
+    """Ask the user to confirm that the CSV files have been copied."""
+    print("""
+  ─────────────────────────────────────────────────────────
+  Copy these files into Neo4j's import directory:
+    · organization_nodes.csv
+    · rel_affiliated_with.csv
+  ─────────────────────────────────────────────────────────
+""")
+    try:
+        ans = input("  Files copied? Press Enter to continue, or 'no' to abort: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\n  Aborted.")
+        sys.exit(0)
+    if ans in ("no", "n", "q", "quit", "exit"):
+        print("  Upload skipped.")
+        sys.exit(0)
+    print()
+
+
+# =============================================================================
+# UPLOAD
+# =============================================================================
 
 def run_updates(session) -> None:
-    """
-    Add one ``LOAD CSV`` + ``MERGE`` block per file you generated in FormatUpdateCSV.
+    # ── Constraint ────────────────────────────────────────────────────────────
+    print("\n  -- Constraint")
+    _run(session, "Constraint Organization.orgId",
+         "CREATE CONSTRAINT organization_orgid IF NOT EXISTS "
+         "FOR (o:Organization) REQUIRE o.orgId IS UNIQUE")
 
-    Example matches the placeholder files created by ``FormatUpdateCSV.py``.
-    Uncomment or replace with your real schema.
-    """
-    # Optional: uniqueness for new labels (run once; IF NOT EXISTS is safe)
-    # session.run(
-    #     "CREATE CONSTRAINT tag_id IF NOT EXISTS "
-    #     "FOR (t:Tag) REQUIRE t.tagId IS UNIQUE"
-    # )
+    # ── Organization nodes ────────────────────────────────────────────────────
+    print("\n  -- Organization nodes")
+    _run(session, "Organization nodes", f"""
+        LOAD CSV WITH HEADERS FROM 'file:///organization_nodes.csv'
+        AS row FIELDTERMINATOR ';'
+        CALL {{
+            WITH row
+            WITH row WHERE row.orgId IS NOT NULL AND trim(row.orgId) <> ''
+            MERGE (o:Organization {{orgId: trim(row.orgId)}})
+              SET o.name    = trim(row.name),
+                  o.orgType = trim(row.orgType)
+        }} IN TRANSACTIONS OF {NODE_BATCH} ROWS
+    """)
 
-    # Example — adjust paths if your import folder filename differs
-    # session.run("""
-    #     LOAD CSV WITH HEADERS FROM 'file:///update_tag_nodes.csv'
-    #     AS row FIELDTERMINATOR ';'
-    #     CALL {
-    #         WITH row
-    #         WITH row WHERE row.tagId IS NOT NULL AND trim(row.tagId) <> ''
-    #         MERGE (t:Tag {tagId: trim(row.tagId)})
-    #           SET t.name = trim(row.name)
-    #     } IN TRANSACTIONS OF 200 ROWS
-    # """)
+    # ── affiliated_with edges (Author → Organization) ─────────────────────────
+    # :START_ID = Author.authorId   :END_ID = Organization.orgId
+    # MATCH is used (not MERGE on node) so rows with no matching Author or
+    # Organization are silently skipped — no error, no dangling relationships.
+    print("\n  -- affiliated_with  (Author → Organization)")
+    _run(session, "affiliated_with edges", f"""
+        LOAD CSV WITH HEADERS FROM 'file:///rel_affiliated_with.csv'
+        AS row FIELDTERMINATOR ';'
+        CALL {{
+            WITH row
+            MATCH (a:Author       {{authorId: trim(row.`:START_ID`)}})
+            MATCH (o:Organization {{orgId:    trim(row.`:END_ID`)}})
+            MERGE (a)-[:affiliated_with]->(o)
+        }} IN TRANSACTIONS OF {REL_BATCH} ROWS
+    """)
 
-    # session.run("""
-    #     LOAD CSV WITH HEADERS FROM 'file:///rel_paper_tagged.csv'
-    #     AS row FIELDTERMINATOR ';'
-    #     CALL {
-    #         WITH row
-    #         MATCH (p:Paper {paperId: trim(row.`:START_ID`)})
-    #         MATCH (t:Tag   {tagId:   trim(row.`:END_ID`)})
-    #         MERGE (p)-[:tagged_with]->(t)
-    #     } IN TRANSACTIONS OF 500 ROWS
-    # """)
+    # ── Verification ──────────────────────────────────────────────────────────
+    print("\n  -- Verification")
+    for r in session.run(
+        "MATCH (o:Organization) "
+        "RETURN o.orgType AS type, count(o) AS n "
+        "ORDER BY n DESC"
+    ):
+        print(f"    Organization ({r['type']:10s}) : {r['n']:,}")
 
-    print("  [info] No default LOAD CSV blocks enabled — edit UploadUpdateCSV.py "
-          "to match your A.3 CSVs and schema.")
+    aff_count = session.run(
+        "MATCH (:Author)-[:affiliated_with]->(:Organization) "
+        "RETURN count(*) AS n"
+    ).single()["n"]
+    print(f"    affiliated_with edges       : {aff_count:,}")
 
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main() -> None:
-    pw = get_password()
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, pw), connection_timeout=120)
+    print("=" * 60)
+    print("  UploadUpdateCSV.py — A.3  (Organization + affiliated_with)")
+    print("=" * 60)
+
+    pw = _get_password()
+    _pause()
+
+    print(f"  Connecting to {NEO4J_URI} …")
     try:
+        driver = GraphDatabase.driver(
+            NEO4J_URI,
+            auth=(NEO4J_USER, pw),
+            connection_timeout=120,
+            max_transaction_retry_time=300,
+        )
         driver.verify_connectivity()
-        print("Connected to", NEO4J_URI)
-        with driver.session() as session:
-            run_updates(session)
-    finally:
-        driver.close()
-    print("UploadUpdateCSV finished.")
+        print("  ✓  Connected\n")
+    except Exception as e:
+        print(f"  ✗  Connection failed: {e}")
+        print("     Is Neo4j running? Is the password correct?")
+        sys.exit(1)
+
+    with driver.session() as session:
+        run_updates(session)
+
+    driver.close()
+    print("\n  Update complete.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nAborted.", file=sys.stderr)
+        print("\n  Aborted.", file=sys.stderr)
         sys.exit(1)

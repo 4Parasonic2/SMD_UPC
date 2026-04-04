@@ -39,12 +39,15 @@ REL_BATCH    = 500
 DELETE_BATCH = 5000
 
 # Filled by ``_load_upload_limits()`` — must match the last ``FormatCSV.py`` run.
-UPLOAD_NODE_LIMIT: int | None = None
-UPLOAD_REL_LIMIT:  int | None = None
+# Separate limits for paper files, author files, and relationship files so each
+# LOAD CSV caps at the value used during CSV generation.
+UPLOAD_PAPER_LIMIT:  int | None = None
+UPLOAD_AUTHOR_LIMIT: int | None = None
+UPLOAD_REL_LIMIT:    int | None = None
 
-# Fallback scaling if ``pipeline_config.json`` is missing
-_BASE_AUTHORS   = 4_200_000
-_BASE_AUTHORED  = 28_000_000
+# Fallback defaults when pipeline_config.json is missing.
+_DEFAULT_MAX_PAPERS  = 20_000
+_DEFAULT_MAX_AUTHORS = 30_000
 
 
 def _row_limit_clause(limit: int | None) -> str:
@@ -52,59 +55,30 @@ def _row_limit_clause(limit: int | None) -> str:
 
 
 def _load_upload_limits() -> None:
-    """Set ``UPLOAD_NODE_LIMIT`` / ``UPLOAD_REL_LIMIT`` from config or user input."""
-    global UPLOAD_NODE_LIMIT, UPLOAD_REL_LIMIT
+    """Set upload limit globals from pipeline_config.json, or use defaults."""
+    global UPLOAD_PAPER_LIMIT, UPLOAD_AUTHOR_LIMIT, UPLOAD_REL_LIMIT
 
+    print("=" * 60)
     if os.path.isfile(PIPELINE_CONFIG):
         with open(PIPELINE_CONFIG, encoding="utf-8") as f:
             cfg = json.load(f)
-        UPLOAD_NODE_LIMIT = cfg.get("upload_node_limit")
-        UPLOAD_REL_LIMIT  = cfg.get("upload_rel_limit")
-        frac = cfg.get("fraction", "?")
-        print("=" * 60)
-        print("  UploadCSV.py — using", PIPELINE_CONFIG)
-        print(f"    fraction from FormatCSV run: {frac}")
-        if UPLOAD_NODE_LIMIT is None:
-            print("    DBLP row limits: none (full load)")
-        else:
-            print(f"    node file limit: {UPLOAD_NODE_LIMIT:,}")
-            print(f"    rel  file limit: {UPLOAD_REL_LIMIT:,}")
-        print("=" * 60)
-        return
-
-    print("=" * 60)
-    print("  UploadCSV.py — no pipeline_config.json found")
-    print("  (Run FormatCSV.py first, or enter the same fraction as that run.)")
-    print("=" * 60)
-
-    env_sf = os.environ.get("SYNTH_SAMPLE_FRACTION", "").strip()
-    if env_sf:
-        raw = env_sf
+        UPLOAD_PAPER_LIMIT  = cfg.get("upload_paper_limit",  _DEFAULT_MAX_PAPERS)
+        UPLOAD_AUTHOR_LIMIT = cfg.get("upload_author_limit", _DEFAULT_MAX_AUTHORS)
+        UPLOAD_REL_LIMIT    = cfg.get("upload_rel_limit",    _DEFAULT_MAX_AUTHORS * 10)
+        print("  UploadCSV.py — loaded", PIPELINE_CONFIG)
+        print(f"    Paper  node limit : {UPLOAD_PAPER_LIMIT:,}")
+        print(f"    Author node limit : {UPLOAD_AUTHOR_LIMIT:,}")
+        print(f"    Rel    row limit  : {UPLOAD_REL_LIMIT:,}")
     else:
-        print("\n  Data fraction [0.01 – 1.0, default 0.10] for LOAD CSV limits:")
-        try:
-            raw = input("  > ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\n  Aborted.")
-            sys.exit(0)
-
-    fraction = 0.10
-    if raw:
-        try:
-            fraction = float(raw)
-        except ValueError:
-            print(f"  [warning] invalid — using 0.10")
-    fraction = max(0.01, min(1.0, fraction))
-
-    if fraction >= 1.0:
-        UPLOAD_NODE_LIMIT = None
-        UPLOAD_REL_LIMIT  = None
-    else:
-        UPLOAD_NODE_LIMIT = max(1_000, int(_BASE_AUTHORS * fraction))
-        UPLOAD_REL_LIMIT  = max(5_000, int(_BASE_AUTHORED * fraction))
-
-    print(f"  Using fraction {fraction:.0%} → node limit {UPLOAD_NODE_LIMIT}, "
-          f"rel limit {UPLOAD_REL_LIMIT}\n")
+        UPLOAD_PAPER_LIMIT  = _DEFAULT_MAX_PAPERS
+        UPLOAD_AUTHOR_LIMIT = _DEFAULT_MAX_AUTHORS
+        UPLOAD_REL_LIMIT    = _DEFAULT_MAX_AUTHORS * 10
+        print("  UploadCSV.py — pipeline_config.json not found; using defaults")
+        print("  (Run FormatCSV.py first to generate it.)")
+        print(f"    Paper  node limit : {UPLOAD_PAPER_LIMIT:,}")
+        print(f"    Author node limit : {UPLOAD_AUTHOR_LIMIT:,}")
+        print(f"    Rel    row limit  : {UPLOAD_REL_LIMIT:,}")
+    print("=" * 60)
 
 
 def _prompt_neo4j_password() -> None:
@@ -152,9 +126,6 @@ def _pause_before_upload() -> None:
     Copy-Item "{CLEANED_FOLDER}\\*.csv"   "<import-dir>"
     Copy-Item "{SYNTHETIC_FOLDER}\\*.csv" "<import-dir>"
 
-  Mac / Linux:
-    cp "{CLEANED_FOLDER}"/*.csv   <import-dir>/
-    cp "{SYNTHETIC_FOLDER}"/*.csv <import-dir>/
   ─────────────────────────────────────────────────────────
 """)
 
@@ -239,13 +210,10 @@ def run_step_upload() -> None:
     print("STEP 3 — Upload to Neo4j")
     print("=" * 60)
 
-    # Show active limits so it is always clear what will be loaded.
-    if UPLOAD_NODE_LIMIT is None:
-        print("  Row limits       : none (full dataset)")
-    else:
-        print(f"  Node row limit   : {UPLOAD_NODE_LIMIT:,}  per DBLP node file")
-        print(f"  Rel  row limit   : {UPLOAD_REL_LIMIT:,}  per DBLP rel  file")
-        print("  (Synthetic files are already pre-capped — no extra limit needed)")
+    print(f"  Paper  node limit: {UPLOAD_PAPER_LIMIT:,}")
+    print(f"  Author node limit: {UPLOAD_AUTHOR_LIMIT:,}")
+    print(f"  Rel    row limit : {UPLOAD_REL_LIMIT:,}")
+    print("  (Synthetic CSV files are already pre-capped — no extra limit needed)")
 
     print(f"  Connecting to {NEO4J_URI} …")
     try:
@@ -262,9 +230,9 @@ def run_step_upload() -> None:
         print("     Is Neo4j running? Is the password correct?")
         sys.exit(1)
 
-    # Convenience alias — reads the current module-level globals at call time.
-    nl = _row_limit_clause(UPLOAD_NODE_LIMIT)   # e.g. "WITH row LIMIT 420000" or ""
-    rl = _row_limit_clause(UPLOAD_REL_LIMIT)    # e.g. "WITH row LIMIT 2800000" or ""
+    al = _row_limit_clause(UPLOAD_AUTHOR_LIMIT)  # limit for author node file
+    pl = _row_limit_clause(UPLOAD_PAPER_LIMIT)   # limit per paper node file
+    rl = _row_limit_clause(UPLOAD_REL_LIMIT)     # limit for relationship files
 
     with driver.session() as s:
 
@@ -285,12 +253,12 @@ def run_step_upload() -> None:
         # ── 2. Nodes ──────────────────────────────────────────────────────────
         print(f"\n  -- Nodes  (batch={NODE_BATCH})")
 
-        # DBLP node files: apply UPLOAD_NODE_LIMIT via the 'nl' clause.
+        # DBLP node files: cap rows to match what FormatCSV.py selected.
         _run(s, "Author nodes", f"""
             LOAD CSV WITH HEADERS
             FROM 'file:///output_author_clean.csv'
             AS row FIELDTERMINATOR ';'
-            {nl}
+            {al}
             CALL {{
                 WITH row
                 WITH row WHERE row.`:ID` IS NOT NULL AND trim(row.`:ID`) <> ''
@@ -303,7 +271,7 @@ def run_step_upload() -> None:
             LOAD CSV WITH HEADERS
             FROM 'file:///output_inproceedings_clean.csv'
             AS row FIELDTERMINATOR ';'
-            {nl}
+            {pl}
             CALL {{
                 WITH row
                 WITH row WHERE row.inproceedings IS NOT NULL
@@ -320,7 +288,7 @@ def run_step_upload() -> None:
             LOAD CSV WITH HEADERS
             FROM 'file:///output_article_clean.csv'
             AS row FIELDTERMINATOR ';'
-            {nl}
+            {pl}
             CALL {{
                 WITH row
                 WITH row WHERE row.article IS NOT NULL AND trim(row.article) <> ''
@@ -397,11 +365,11 @@ def run_step_upload() -> None:
             }} IN TRANSACTIONS OF {REL_BATCH} ROWS
         """)
 
+        # rel_cites.csv is generated by FormatCSV.py (Step 2.6) by resolving
+        # the DBLP cite-entity indirection into direct Paper→Paper pairs.
         _run(s, "cites  (Paper → Paper)", f"""
-            LOAD CSV WITH HEADERS
-            FROM 'file:///output_cite_has_citation_clean.csv'
+            LOAD CSV WITH HEADERS FROM 'file:///rel_cites.csv'
             AS row FIELDTERMINATOR ';'
-            {rl}
             CALL {{
                 WITH row
                 MATCH (p1:Paper {{paperId: trim(row.`:START_ID`)}})
