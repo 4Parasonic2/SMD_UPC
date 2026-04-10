@@ -479,21 +479,6 @@ def run_step_synth() -> None:
 
     # ── 2.4 Review nodes ─────────────────────────────────────────────────────
     print("\n  -- 2.4  Review nodes  (3 per paper, COI-safe)")
-    DECISIONS = ["accept", "reject", "minor revision", "major revision"]
-    TEMPLATES = [
-        "Solid contribution with a clear and well-structured methodology.",
-        "Interesting approach but the evaluation needs additional baselines.",
-        "Well-written and thorough. The experiments convincingly support the claims.",
-        "The related work section omits several key recent publications.",
-        "Novel method, but scalability concerns are not sufficiently addressed.",
-        "Strong theoretical foundation paired with good empirical results.",
-        "The motivation is clear, but the novelty over existing methods is limited.",
-        "Good paper overall. Minor revisions needed in the introduction.",
-        "The experimental setup is not described in sufficient detail for reproducibility.",
-        "Excellent contribution. Ready for publication with only minor edits.",
-        "The paper tackles an important problem but the solution is over-simplified.",
-        "Comprehensive study with thorough analysis. Recommended for acceptance.",
-    ]
     review_rows:    list = []
     wrote_rev_rows: list = []
     about_rows:     list = []
@@ -503,13 +488,10 @@ def run_step_synth() -> None:
         if len(eligible) < 3:
             skipped += 1
             continue
-        for rank, rid in enumerate(random.sample(eligible, 3)):
+        for rid in random.sample(eligible, 3):
             rev_id = f"REV-{len(review_rows):06d}"
-            review_rows.append({"reviewId": rev_id,
-                                 "text":     random.choice(TEMPLATES),
-                                 "decision": random.choice(DECISIONS)})
-            wrote_rev_rows.append({":START_ID": rid, ":END_ID": rev_id,
-                                    "corresponding": "true" if rank == 0 else "false"})
+            review_rows.append({"reviewId": rev_id})
+            wrote_rev_rows.append({":START_ID": rid, ":END_ID": rev_id})
             about_rows.append({":START_ID": rev_id, ":END_ID": paper_id})
     print(f"  Papers skipped : {skipped:,}")
     print(f"  Reviews created: {len(review_rows):,}")

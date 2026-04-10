@@ -1,18 +1,21 @@
 """
 UploadUpdateCSV.py — A.3
 ========================
-Loads the Organization nodes and affiliated_with edges produced by
-FormatUpdateCSV.py into an existing Neo4j graph.
+Enriches an existing Neo4j graph (built by A.2 UploadCSV.py) with:
+  · Organization nodes + affiliated_with edges (Author → Organization)
+  · Review enrichment  — sets text and decision on bare Review nodes
+  · Venue enrichment   — computes and sets reviewerCount on every Venue node
 
 Before running:
-  1. Run FormatUpdateCSV.py to generate the two CSV files.
-  2. Copy Update_Csvs/organization_nodes.csv and
-          Update_Csvs/rel_affiliated_with.csv
-     into Neo4j's import directory (same folder used by UploadCSV.py).
+  1. Run FormatUpdateCSV.py to generate the three CSV files.
+  2. Copy into Neo4j's import directory (same folder used by UploadCSV.py):
+       · organization_nodes.csv
+       · rel_affiliated_with.csv
+       · review_updates.csv
   3. Run this script.
 
-The script is additive — it MERGEs nodes and relationships so it is safe
-to re-run without creating duplicates.
+The script is additive — it MERGEs nodes / relationships and SETs properties,
+so it is safe to re-run without creating duplicates or data loss.
 
 Requirements:
     pip install neo4j
@@ -75,6 +78,7 @@ def _pause() -> None:
   Copy these files into Neo4j's import directory:
     · organization_nodes.csv
     · rel_affiliated_with.csv
+    · review_updates.csv
   ─────────────────────────────────────────────────────────
 """)
     try:
@@ -104,8 +108,7 @@ def run_updates(session) -> None:
     _run(session, "Organization nodes", f"""
         LOAD CSV WITH HEADERS FROM 'file:///organization_nodes.csv'
         AS row FIELDTERMINATOR ';'
-        CALL {{
-            WITH row
+        CALL (row) {{
             WITH row WHERE row.orgId IS NOT NULL AND trim(row.orgId) <> ''
             MERGE (o:Organization {{orgId: trim(row.orgId)}})
               SET o.name    = trim(row.name),
@@ -114,19 +117,46 @@ def run_updates(session) -> None:
     """)
 
     # ── affiliated_with edges (Author → Organization) ─────────────────────────
-    # :START_ID = Author.authorId   :END_ID = Organization.orgId
-    # MATCH is used (not MERGE on node) so rows with no matching Author or
-    # Organization are silently skipped — no error, no dangling relationships.
+    # MATCH is used so rows with no matching Author or Organization are skipped.
     print("\n  -- affiliated_with  (Author → Organization)")
     _run(session, "affiliated_with edges", f"""
         LOAD CSV WITH HEADERS FROM 'file:///rel_affiliated_with.csv'
         AS row FIELDTERMINATOR ';'
-        CALL {{
-            WITH row
+        CALL (row) {{
             MATCH (a:Author       {{authorId: trim(row.`:START_ID`)}})
             MATCH (o:Organization {{orgId:    trim(row.`:END_ID`)}})
             MERGE (a)-[:affiliated_with]->(o)
         }} IN TRANSACTIONS OF {REL_BATCH} ROWS
+    """)
+
+    # ── Review enrichment — add text + decision ───────────────────────────────
+    # The A.2 base graph created Review nodes with only reviewId.
+    # This step enriches them with the two missing attributes from the model.
+    print("\n  -- Review enrichment  (text + decision)")
+    _run(session, "Review text + decision", f"""
+        LOAD CSV WITH HEADERS FROM 'file:///review_updates.csv'
+        AS row FIELDTERMINATOR ';'
+        CALL (row) {{
+            WITH row WHERE row.reviewId IS NOT NULL AND trim(row.reviewId) <> ''
+            MATCH (r:Review {{reviewId: trim(row.reviewId)}})
+              SET r.text     = trim(row.text),
+                  r.decision = trim(row.decision)
+        }} IN TRANSACTIONS OF {NODE_BATCH} ROWS
+    """)
+
+    # ── Venue enrichment — compute reviewerCount ──────────────────────────────
+    # reviewerCount = number of distinct authors who reviewed at least one paper
+    # published in an issue of that venue.
+    # Computed entirely in Cypher — no CSV required.
+    print("\n  -- Venue enrichment  (reviewerCount)")
+    _run(session, "Venue.reviewerCount", f"""
+        MATCH (v:Venue)
+        CALL (v) {{
+            OPTIONAL MATCH (v)<-[:of_venue]-(:Issue)<-[:published_in]-(:Paper)
+                          <-[:about]-(:Review)<-[:wrote_review]-(a:Author)
+            WITH v, count(DISTINCT a) AS cnt
+            SET v.reviewerCount = cnt
+        }} IN TRANSACTIONS OF {NODE_BATCH} ROWS
     """)
 
     # ── Verification ──────────────────────────────────────────────────────────
@@ -144,6 +174,18 @@ def run_updates(session) -> None:
     ).single()["n"]
     print(f"    affiliated_with edges       : {aff_count:,}")
 
+    rev_enriched = session.run(
+        "MATCH (r:Review) WHERE r.text IS NOT NULL "
+        "RETURN count(r) AS n"
+    ).single()["n"]
+    print(f"    Reviews with text+decision  : {rev_enriched:,}")
+
+    venue_enriched = session.run(
+        "MATCH (v:Venue) WHERE v.reviewerCount IS NOT NULL "
+        "RETURN count(v) AS n"
+    ).single()["n"]
+    print(f"    Venues with reviewerCount   : {venue_enriched:,}")
+
 
 # =============================================================================
 # MAIN
@@ -151,7 +193,8 @@ def run_updates(session) -> None:
 
 def main() -> None:
     print("=" * 60)
-    print("  UploadUpdateCSV.py — A.3  (Organization + affiliated_with)")
+    print("  UploadUpdateCSV.py — A.3")
+    print("  (Organization + Reviews + Venue reviewerCount)")
     print("=" * 60)
 
     pw = _get_password()
